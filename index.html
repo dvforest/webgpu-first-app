@@ -1,0 +1,373 @@
+<!doctype html>
+
+<html>
+    <head>
+        <meta charset="utf-8"
+        <title> WebGPU Life</title>
+    </head>
+    <body>
+        <canvas width="512" height="512"></canvas>
+        <script type="module">
+            
+            const GRID_SIZE = 32;
+
+            const UPDATE_INTERVAL = 120; // update every 200 ms (5 times/sec)
+            let step = 0; // track how many simulation steps have been run
+
+            const WORKGROUP_SIZE = 8; // To perform compute calculations in a shader, you need to divide them into workgroups. A workgroup has a X, Y and Z size. They can be 1 each, but there are performance benefits to make them a bit bigger.
+
+            const canvas = document.querySelector("canvas");
+
+            // First we make sure that the browser supports WebGPU, otherwise we throw an error
+            if (!navigator.gpu) {
+                throw new Error("WebGPU not supported on this browser.");
+            }
+
+            // Second, make sure that the hardware also supports WebGPU
+            // An adapter is WebGPU's representation of a specific piece of GPU hardware in your device.
+            const adapter = await navigator.gpu.requestAdapter();
+            if (!adapter) {
+                throw new Error ("No appropriate GPUAdapter found.");
+            }
+
+            // Once this is done, we get the GPU device.
+            // It is the main interface through which most interaction with the GPU happens.
+            const device = await adapter.requestDevice();
+
+            //Now we need to configure the canvas to be used with the device we created.
+            const context = canvas.getContext("webgpu");
+            const canvasFormat = navigator.gpu.getPreferredCanvasFormat();
+            context.configure({
+                device: device,
+                format: canvasFormat,
+            });
+
+            // To make a square, we need an array of vertices. Float32 array will be used.
+            // It is a TypeArray, which means it allocates contiguous blocks of memory
+            const vertices = new Float32Array([
+              //  X,    Y,
+                -0.8, -0.8, // Triangle 1
+                 0.8, -0.8,
+                 0.8,  0.8,
+
+                -0.8, -0.8, // Triangle 2
+                 0.8,  0.8,
+                -0.8,  0.8,
+            ]);
+            
+            //But the GPU cannot draw with Javascript arrays. We need to place the vertex values in a GPUBuffer,
+            // a block of memory easily accessible by the GPU, and flagged for certain purposes
+            const vertexBuffer = device.createBuffer({
+                label: "Cell vertices", // giving your buffer a label helps you later reference that buffer if there's an error
+                size: vertices.byteLength, // size is 48, calculated for us automatically by byteLength. It's the number of floats in given vertices (12) multiplied by size of a 32-bit float (4 bytes).
+                usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST, // flags specifying the usage for the buffer. "|" is a binary OR operator and allows for multiple flags. Here we say we want the buffer to be used for vertex data, and we want to be able to copy data into it.
+                // Note: attributes from a buffer object are immutable. You can't resize it or change the flags, only change the contents of its memory.
+            });
+
+            // Let's copy the javascript array into the buffer
+            // The 0 represents the offset, in bytes, to start writing the data inside the GPUBuffer
+            device.queue.writeBuffer(vertexBuffer, 0, vertices);
+
+            // We have a buffer with vertex data in it! But it's still just a blob of bytes.
+            // We need to tell the GPU what to do with it.
+            // We need to create a GPUVertexBufferLayout dictionnary that will give more info about the structure of the vertex data
+
+            const vertexBufferLayout =  {
+                arrayStride: 8, // number of bytes before we skip to next vertex (the vertex position is 32-bit floats which are 4 bytes each)
+                attributes: [{ // Attributes is an array, containing another dictionnary. Here we only have one attribute for position.
+                    format: "float32x2", // comes from a list of GPUVertexFormat. Another vertex data format could be uint16x4 (4 unsigned integers), but here our vertices are made of 2 floats
+                    offset: 0, // how many bytes into the vertex this particular attribute starts. Only important if you have more than 1 attribute, which is not the case here
+                    shaderLocation: 0, // Can be a unique number between 0 and 15. Each attribute must have a different input number.
+                }]
+            };
+
+            //Now let's also create an array and buffer for a grid.
+            const uniformArray = new Float32Array([GRID_SIZE, GRID_SIZE]);
+            const uniformBuffer = device.createBuffer({
+                label: "Grid Uniforms",
+                size: uniformArray.byteLength,
+                usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+            });
+            device.queue.writeBuffer(uniformBuffer, 0, uniformArray);
+
+            // Create a storage buffer for cell state. A storage buffer doesn't need any specific declared size.
+            const cellStateArray = new Uint32Array(GRID_SIZE * GRID_SIZE); // The reason here we use GRID_SIZE * GRID_SIZE instead of [GRID_SIZE, GRID_SIZE] is that this time we want an array of the total number of cells, whereas before we wanted to create a coordinate system with [x,y] positions.
+            const cellStateBuffer = [
+                device.createBuffer({
+                    label: "Cell State A",
+                    size: cellStateArray.byteLength,
+                    usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+                }),
+                device.createBuffer({
+                    label: "Cell State B",
+                    size: cellStateArray.byteLength,
+                    usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+                })
+            ];
+            // Mark every third cell of the first grid as active
+            for (let i = 0; i < cellStateArray.length; i++) {
+                cellStateArray[i] = Math.random() > 0.6 ? 1 : 0; // Set state to 1 is random number is higher than 0.6, otherwise set to 0
+            }
+            device.queue.writeBuffer(cellStateBuffer[0], 0, cellStateArray);
+
+            // We have all the values we need to pass to the shader. Let's create the shader itself.
+            const cellShaderModule = device.createShaderModule({
+                label: "Cell shader",
+                code: `
+                    struct VertexInput {
+                        @location(0) pos: vec2f,
+                        @builtin(instance_index) instance: u32,
+                    };
+
+                    struct VertexOutput {
+                        @builtin(position) pos: vec4f,
+                        @location(0) cell: vec2f,
+                    };
+                   
+                    @group(0) @binding(0) var<uniform> grid: vec2f;
+                    @group(0) @binding(1) var<storage> cellState: array<u32>;
+
+                    @vertex
+                    fn vertexMain(input: VertexInput) -> VertexOutput {
+                        
+                        let i = f32(input.instance);
+                        let cell = vec2f(i % grid.x, floor(i / grid.x));
+                        let state = f32(cellState[input.instance]);
+                        let cellOffset = cell / grid * 2;
+                        let gridPos = (input.pos * state + 1) / grid - 1 + cellOffset;
+                        
+                        var output: VertexOutput;
+                        output.pos = vec4f(gridPos, 0, 1);
+                        output.cell = cell;
+                        return output;
+                        }
+
+                    @fragment
+                    fn fragmentMain(input: VertexOutput) -> @location(0) vec4f {
+                        let c = input.cell / grid;
+                        return vec4f(c, 1-c.x, 1);
+                        }
+
+                    ` 
+                    // Backticks are used for multi-line strings.
+                      // This shader code is in WGSL (WebGPU Shading Language)
+                      // @vertex is meant to tell the shader which phase we're in, such as Vertex processing, Fragment processing, or Compute
+                      // A vertex shader is called as a function by the GPU, once for every vertex in the buffer. This one will be called 6 times, once for each vertex.
+                      // fn is used to create a new function
+                      // struct are named object types with one or more named properties. They can be used as the input and output for the vertex shader function
+                      // vec4f (as well as vec3f and vec2f) are built-in first class primitives in the WGSL language
+                      // @location(0) refers to the shaderLocation in our buffer (index 0). We name it pos, and define it as vec2f, since we know it's a float32x2
+                      // @builtin(instance_index) returns an index starting at 0 and going all the way up to the number of instances being drawn. This allows the same geometry to be drawn in different places.
+                      // f32(...) just means that you convert a different type of values to float 32.
+                      // instead of return vec4f(pos, 0, 1), we could have written vec4f(pos.x, pos.y, 0, 1). This is a shorthand to convert matrices.
+                    
+                      // About the section where pos / grid. These are two vec2f. Such vector operations are quite common in WGSL
+                      // The result is the same as if we had done vec2f(pos.x / grid.x, pos.y / grid.y) 
+                      // Similarly, when you do pos + 1, it's the same as doing pos + vec2f(1, 1)
+
+                        // @fragment: Now we need to use this result to call the Fragment shader, a function called once for every pixel being drawn.
+                        // WebGPU will automatically triangulate the vertices from the vertex shader to determine the location of all the pixels that need to be drawn.
+                        // The value returned is a vec4f for color (RGBA).
+            });
+
+            const simulationShaderModule = device.createShaderModule({
+                label: "Game of Life simulation shader",
+                code: `
+                    @group(0) @binding(0) var<uniform> grid: vec2f;
+                    @group(0) @binding(1) var<storage> cellStateIn: array<u32>;
+                    @group(0) @binding(2) var<storage, read_write> cellStateOut: array<u32>;
+
+                    fn cellIndex(cell: vec2u) -> u32 {
+                        return (cell.y % u32(grid.y)) * u32(grid.x) +
+                               (cell.x % u32(grid.x));
+                    }
+
+                    fn cellActive(x: u32, y: u32) -> u32 {
+                        return cellStateIn[cellIndex(vec2(x, y))];
+                    }
+
+                    @compute @workgroup_size(${WORKGROUP_SIZE}, ${WORKGROUP_SIZE})
+                    
+                    fn computeMain(@builtin(global_invocation_id) cell: vec3u) {
+                        let activeNeighbors = cellActive(cell.x + 1, cell.y + 1) +
+                                              cellActive(cell.x + 1, cell.y) +
+                                              cellActive(cell.x + 1, cell.y - 1) +
+                                              cellActive(cell.x, cell.y - 1) +
+                                              cellActive(cell.x - 1, cell.y - 1) +
+                                              cellActive(cell.x - 1, cell.y) +
+                                              cellActive(cell.x - 1, cell.y + 1) +
+                                              cellActive(cell.x, cell.y + 1);
+
+                        let i = cellIndex(cell.xy);
+
+                        switch activeNeighbors {
+                            case 2: {
+                                cellStateOut[i] = cellStateIn[i];
+                            }
+
+                            case 3: {
+                                cellStateOut[i] = 1;
+                            }
+
+                            default: {  
+                                cellStateOut[i] = 0;
+                            }
+                        }
+                    }
+                `
+                // WORKGROUP_SIZE is written using $(), which is a template literal, which allows to insert a variable inside a string (which our shader code is)
+                // This tells our shader that work will be done in (8 x 8 x 1) groups. Any axis you leave off defaults to 1, but you need at least the X axis.
+                // It's difficult to find the exact workgroup size and it will depend on each hardware, but 8 by 8 (64) is usually reasonably efficient.
+                // global_invocation_id is a 3-dimensional vector of unsigned integers that tell you where in the grid of shader invocation you are. You get numbers like [1,0,0], [1,1,0], or [31,31,0]
+                // We'll use the global_invocation_id as the cell index we operate on.
+                // Compute shaders can also use uniforms, such as the grid we used in the vertex shader.
+                // var<storage> creates a read_only buffer. We need two buffers to properly update the state of each cell. The second one is set as read_write, which will let us write the new cell state.  
+                // Compute shaders don't have any outputs. Writing values to a storage buffer is the only way to get results out of a compute shader.
+                // The cell index function allows us to start from an array format (let's say [4,2]), and convert it to an index format (12). This is done by multiplying the Y by the grid width, and adding the X.
+                // We've added a modulo (%) so that the values wrap past the bounds of the grid. Let's say you give [5,1] in a 4x4 grid, (where 0,1,2,3 are the only valid values) the 4 becomes 0, wrapping back to the first column.
+                // The function is necessary because the input given to the compute shader is given by the global_invocation_id which is a vec3u.
+                // the cellActive function is given a x and y value, and checks if the state is 0 or 1.
+                // the activeNeighbors variable checks each surrounding cells, and adds the number, for a possible total of 8 if all are active.
+
+            });
+
+            // Because we want to share bind groups between the vertex shader and compute shader, we cannot use auto for the bindGroupLayout anymore.
+            // We need to manully set our bindGroupLayout like this, saying which part are visible to each shader
+            // The different between a bind group and a bind group layout is that the bind group describes the resource itself, whereas the layout describes the type of resource and how it's used
+
+            const bindGroupLayout = device.createBindGroupLayout({
+                label: "Cell Bind Group Layout",
+                entries: [{ // We declare three different entries, each a dictionnary with a different binding number
+                    binding: 0,
+                    visibility: GPUShaderStage.VERTEX | GPUShaderStage.COMPUTE | GPUShaderStage.FRAGMENT,
+                    buffer: {} // The grid uniform buffer. Leaving nothing goes to default, which is uniform.
+                }, {
+                    binding: 1,
+                    visibility: GPUShaderStage.VERTEX | GPUShaderStage.COMPUTE | GPUShaderStage.FRAGMENT,
+                    buffer: { type: "read-only-storage"} // Cell State input buffer
+                }, {
+                    binding: 2,
+                    visibility: GPUShaderStage.COMPUTE,
+                    buffer: { type: "storage"} // Cell State output buffer. (just saying storage means Read and write)
+                }]
+            });
+
+            // We'll also create a render pipeline layout to match with the updated bind groups
+            // It contains a list of bindGroupLayout (we only have one), that one or more pipelines can use
+            // The order of bindGroupLayout in the list needs to match the @group, so this one corresponds to @group(0)
+
+            const pipelineLayout = device.createPipelineLayout({
+                label: "Cell Pipeline Layout",
+                bindGroupLayouts: [ bindGroupLayout ],
+            });
+
+            // The shader module is done, but it can't be used on its own.
+            // We need to use it as part of a GPURenderPipeline.
+            // That's where we plug in all the things we built previously (shader module, function, buffer, etc)
+
+            const cellPipeline = device.createRenderPipeline({
+                label: "Cell pipeline",
+                layout: pipelineLayout,
+                vertex: {
+                    module: cellShaderModule,
+                    entryPoint: "vertexMain", // the function in the shader to execute first
+                    buffers: [vertexBufferLayout]
+                },
+                fragment: {
+                    module: cellShaderModule,
+                    entryPoint: "fragmentMain", // the function in the shader to execute first
+                    targets: [{
+                        format: canvasFormat // This is variable declared earlier
+                    }]
+                }
+            });
+
+            // We need a separate pipeline for the compute shader
+            const simulationPipeline = device.createComputePipeline({
+                label: "Simulation pipeline",
+                layout: pipelineLayout,
+                compute: {
+                    module: simulationShaderModule,
+                    entryPoint: "computeMain", // the function in the shader to execute first
+                }
+            });
+
+            // Creating a bindgroup is necessary so that the grid buffer is connected
+            const bindGroups = [
+                device.createBindGroup({
+                    label: "Cell renderer bind group A",
+                    layout: bindGroupLayout,
+                    entries: [{
+                        binding: 0, //corresponds to the @binding value entered in the shader.
+                        resource: { buffer: uniformBuffer } //what resource we want to expose to the variable at the specified binding index
+                    },  {
+                        binding: 1,
+                        resource: { buffer: cellStateBuffer[0] }
+                    },  {
+                        binding: 2,
+                        resource: { buffer: cellStateBuffer[1] }
+                    }],
+                }),
+                device.createBindGroup({
+                    label: "Cell renderer bind group B",
+                    layout: cellPipeline.getBindGroupLayout(0),
+                    entries: [{
+                        binding: 0,
+                        resource: { buffer: uniformBuffer }
+                    }, {
+                        binding: 1,
+                        resource: { buffer: cellStateBuffer[1] }
+                    }, {
+                        binding: 2,
+                        resource: { buffer: cellStateBuffer[0] }
+                    }],
+                })
+            ];
+
+            function updateGrid() {
+                
+                const encoder = device.createCommandEncoder();
+                
+                // Start a compute pass 
+                const computePass = encoder.beginComputePass();
+                computePass.setPipeline(simulationPipeline);
+                computePass.setBindGroup(0, bindGroups[step % 2]);
+                
+                // One thing VERY important to note here. The number you pass is NOT the number of invocations.
+                // It is the number of workgroups as defined by @workgroup_size in the compute shader.
+                // Let's say we have a grid of 32 x 32, and our workgroup size is 8 x 8, you need to dispatch 4x4 workgroups.
+                // That's why you divide the grid size by the workgroup size, and pass that value into dispatchWorkgroups()
+                const workGroupCount = Math.ceil(GRID_SIZE / WORKGROUP_SIZE)
+                // Important: In the event that you need to dispatch a number of workgroups that can't easily be divided,
+                // you should round up the number of workgroups, and then in the shader you check if you you're over the desired global_invocation_id and return the function early
+                computePass.dispatchWorkgroups(workGroupCount, workGroupCount); 
+                computePass.end();
+    
+                step ++ // Increment the step count. By doing it between passes, the output buffer of the compute pipeline becomes the input buffer of the render pipeline
+                
+                // Start a render pass
+                const pass = encoder.beginRenderPass({
+                    colorAttachments: [{
+                        view: context.getCurrentTexture().createView(), //we're using createView with no argument here, meaning we want it to use the full texture
+                        loadOp: "clear", //clear the texture when render pass starts
+                        clearValue: [0, 0, 0, 1], // choose background color in RGBA
+                        storeOp: "store", //store result of any drawing into the texture when render pass ends.
+                    }]
+                });
+
+                pass.setPipeline(cellPipeline);
+                pass.setVertexBuffer(0, vertexBuffer); // called with 0 because it corresponds to the 0th element in the current pipeline's vertex.buffers definition
+                pass.setBindGroup(0, bindGroups[step % 2]); // the 0 corresponds to the @group(0) in the shader code. We're saying that each @binding that's part of @group(0) uses the resources in this bind group.
+                pass.draw(vertices.length / 2, GRID_SIZE * GRID_SIZE); // divide by two because we have two values (position x and y) per vertex, the second argument tells how many instances of the geometry to draw
+                
+                // End the render pass and submit to command buffer
+                pass.end();
+                device.queue.submit([encoder.finish()]);
+            }
+
+            // Schedule updateGrid() to run repeatedly
+            setInterval(updateGrid, UPDATE_INTERVAL);
+            
+        </script>
+    </body>
+</html>
